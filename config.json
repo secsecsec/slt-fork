@@ -1,0 +1,17 @@
+{
+    "bind_addr": ":80",
+    "bind_addr_secure": ":443",
+    "frontends": {
+        "test.dev": {
+            "backends": [{
+                "addr": "vyatich.dev:81",
+                "connect_timeout": 30
+            }]
+        },
+        "vyatich.dev": {
+            "backends": [{
+                "addr": "vyatich.dev:81"
+            }]
+        }
+    }
+}

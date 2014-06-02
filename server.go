@@ -2,12 +2,12 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	vhost "github.com/inconshreveable/go-vhost"
 	"io"
 	"io/ioutil"
-	"launchpad.net/goyaml"
 	"log"
 	"net"
 	"os"
@@ -27,25 +27,26 @@ type Options struct {
 }
 
 type Backend struct {
-	Addr           string `"yaml:addr"`
-	ConnectTimeout int    `yaml:connect_timeout"`
+	Addr           string `"json:addr"`
+	ConnectTimeout int    `json:connect_timeout"`
 }
 
 type Frontend struct {
-	Backends []Backend `yaml:"backends"`
-	Strategy string    `yaml:"strategy"`
-	TLSCrt   string    `yaml:"tls_crt"`
+	Backends []Backend `json:"backends"`
+	Strategy string    `json:"strategy"`
+	TLSCrt   string    `json:"tls_crt"`
 	mux      *vhost.TLSMuxer
-	TLSKey   string `yaml:"tls_key"`
-	Default  bool   `yaml:"default"`
+	TLSKey   string `json:"tls_key"`
+	Default  bool   `json:"default"`
 
-	strategy  BackendStrategy `yaml:"-"`
-	tlsConfig *tls.Config     `yaml:"-"`
+	strategy  BackendStrategy `json:"-"`
+	tlsConfig *tls.Config     `json:"-"`
 }
 
 type Configuration struct {
-	BindAddr        string               `yaml:"bind_addr"`
-	Frontends       map[string]*Frontend `yaml:"frontends"`
+	BindAddr        string               `json:"bind_addr"`
+	BindAddrSecure  string               `json:"bind_addr_secure"`
+	Frontends       map[string]*Frontend `json:"frontends"`
 	defaultFrontend *Frontend
 }
 
@@ -55,8 +56,69 @@ type Server struct {
 	wait sync.WaitGroup
 
 	// these are for easier testing
-	mux   *vhost.TLSMuxer
-	ready chan int
+	mux       *vhost.HTTPMuxer
+	muxSecure *vhost.TLSMuxer
+	ready     chan int
+}
+
+func (s *Server) RunSecure() error {
+	// bind a port to handle TLS connections
+	l, err := net.Listen("tcp", s.Configuration.BindAddrSecure)
+	if err != nil {
+		return err
+	}
+	s.Printf("Serving connections on %v", l.Addr())
+
+	// start muxing on it
+	s.muxSecure, err = vhost.NewTLSMuxer(l, muxTimeout)
+	if err != nil {
+		return err
+	}
+
+	// wait for all frontends to finish
+	s.wait.Add(len(s.Frontends))
+
+	// setup muxing for each frontend
+	for name, front := range s.Frontends {
+		fl, err := s.mux.Listen(name)
+		if err != nil {
+			return err
+		}
+		go s.runFrontend(name, front, fl)
+	}
+
+	// custom error handler so we can log errors
+	go func() {
+		for {
+			conn, err := s.mux.NextError()
+
+			if conn == nil {
+				s.Printf("Failed to mux next connection, error: %v", err)
+				if _, ok := err.(vhost.Closed); ok {
+					return
+				} else {
+					continue
+				}
+			} else {
+				if _, ok := err.(vhost.NotFound); ok && s.defaultFrontend != nil {
+					go s.proxyConnection(conn, s.defaultFrontend)
+				} else {
+					s.Printf("Failed to mux connection from %v, error: %v", conn.RemoteAddr(), err)
+					// XXX: respond with valid TLS close messages
+					conn.Close()
+				}
+			}
+		}
+	}()
+
+	// we're ready, signal it for testing
+	if s.ready != nil {
+		close(s.ready)
+	}
+
+	s.wait.Wait()
+
+	return nil
 }
 
 func (s *Server) Run() error {
@@ -68,7 +130,7 @@ func (s *Server) Run() error {
 	s.Printf("Serving connections on %v", l.Addr())
 
 	// start muxing on it
-	s.mux, err = vhost.NewTLSMuxer(l, muxTimeout)
+	s.mux, err = vhost.NewHTTPMuxer(l, muxTimeout)
 	if err != nil {
 		return err
 	}
@@ -213,7 +275,7 @@ func parseArgs() (*Options, error) {
 			"by inspecting the SNI extension on each incoming connection. This\n"+
 			"allows you to accept connections to many different backend TLS\n"+
 			"applications on a single port.\n\n"+
-			"%s takes a single argument: the path to a YAML configuration file.\n\n", os.Args[0], os.Args[0])
+			"%s takes a single argument: the path to a JSON configuration file.\n\n", os.Args[0], os.Args[0])
 	}
 	flag.Parse()
 
@@ -230,9 +292,8 @@ func parseArgs() (*Options, error) {
 func parseConfig(configBuf []byte, loadTLS loadTLSConfigFn) (config *Configuration, err error) {
 	// deserialize/parse the config
 	config = new(Configuration)
-	if err = goyaml.Unmarshal(configBuf, &config); err != nil {
-		err = fmt.Errorf("Error parsing configuration file: %v", err)
-		return
+	if err := json.Unmarshal(configBuf, &config); err != nil {
+		panic(err)
 	}
 
 	// configuration validation / normalization
@@ -318,9 +379,10 @@ func main() {
 	// run server
 	s := &Server{
 		Configuration: config,
-		Logger:        log.New(os.Stdout, "slt ", log.LstdFlags|log.Lshortfile),
+		Logger:        log.New(os.Stdout, " ", log.LstdFlags|log.Lshortfile),
 	}
 
+	go s.RunSecure()
 	// this blocks unless there's a startup error
 	err = s.Run()
 	if err != nil {
